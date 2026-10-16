@@ -24,15 +24,20 @@ class _Process:
     monitor: asyncio.Task[None] | None = None
     reader: asyncio.Task[None] | None = None
     secrets: tuple[str, ...] = field(default=(), repr=False)
+    group_cleaned: bool = False
 
 
-async def _terminate(process: asyncio.subprocess.Process) -> None:
-    if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-    elif process.returncode is None:
-        process.kill()
-    await process.wait()
+async def _terminate(job: _Process) -> None:
+    if not job.group_cleaned:
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(job.process.pid, signal.SIGKILL)
+        elif job.process.returncode is None:
+            job.process.kill()
+        # Record the signal before awaiting: cancellation must not signal this
+        # historic process group again after its numeric ID can be recycled.
+        job.group_cleaned = True
+    await job.process.wait()
 
 
 async def _drain(job: _Process) -> None:
@@ -44,11 +49,13 @@ async def _drain(job: _Process) -> None:
 
 
 class CopilotWorker:
-    """Run trusted Copilot CLI tasks with read/write permissions, not shell access.
+    """Run trusted Copilot tasks with read/write grants and explicit shell denial.
 
     !!! warning "Experimental"
         A worktree is isolation for changes, NOT a security sandbox. The CLI
         inherits the host's OS access and user credential store through `HOME`.
+        Shell denial restricts the agent's shell tool, not trusted CLI hooks,
+        plugins, or repository code.
         Use a container/VM and dedicated credentials for untrusted work.
 
     Args:
@@ -84,9 +91,9 @@ class CopilotWorker:
             state = WorkerState.CANCELLED
             raise
         finally:
-            await _terminate(job.process)
+            await _terminate(job)
             if job.reader is not None:
-                await job.reader
+                await asyncio.shield(job.reader)
             job.state = state
 
     async def submit(self, prompt: str, *, cwd: Path | None) -> str:
@@ -100,7 +107,7 @@ class CopilotWorker:
         if self._closed or cwd is None or executable is None:
             msg = "Copilot worker is closed, missing its workspace, or not installed."
             raise WorkerError(msg)
-        arguments = [executable, "-p", prompt]
+        arguments = [executable, "-p", prompt, "--deny-tool", "shell"]
         for permission in self._allowed_tools:
             arguments.extend(("--allow-tool", permission))
         environment = {key: value for key, value in os.environ.items() if key in _ENVIRONMENT}
@@ -118,8 +125,9 @@ class CopilotWorker:
             process = await asyncio.shield(pending)
         except asyncio.CancelledError:
             process = await pending
-            reader = asyncio.create_task(_drain(_Process(process)))
-            await _terminate(process)
+            job = _Process(process)
+            reader = asyncio.create_task(_drain(job))
+            await _terminate(job)
             await reader
             raise
         except OSError:
@@ -166,14 +174,16 @@ class CopilotWorker:
             handle: Private handle returned by `submit`.
         """
         job = self._job(handle)
+        if job.group_cleaned and job.state.terminal:
+            return
         if job.monitor is not None and not job.monitor.done():
             job.monitor.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await job.monitor
         # Also handles cancellation before the monitor's first scheduling turn.
-        await _terminate(job.process)
+        await _terminate(job)
         if job.reader is not None:
-            await job.reader
+            await asyncio.shield(job.reader)
         if not job.state.terminal:
             job.state = WorkerState.CANCELLED
 

@@ -38,8 +38,9 @@ async def test_fixed_api_create_poll_result_and_terminate(monkeypatch):
             {"session_id": "devin_abc-123"},
             {"status_enum": "working"},
             {"status_enum": "finished", "messages": [{"message": "done"}], "structured_output": {"tests": "passed"}},
+            {"status": "running", "status_enum": "finished"},
             {},
-            {"status_enum": "stopped"},
+            {"status": "exit", "status_enum": "stopped"},
         ],
     )
     worker = DevinWorker(api_key="private-test-credential", timeout=7)
@@ -52,10 +53,10 @@ async def test_fixed_api_create_poll_result_and_terminate(monkeypatch):
     assert "done" in result.output
     await worker.cancel(handle)
     await worker.aclose()
-    assert [request.get_method() for request, _ in requests] == ["POST", "GET", "GET", "DELETE", "GET"]
+    assert [request.get_method() for request, _ in requests] == ["POST", "GET", "GET", "GET", "DELETE", "GET"]
     assert [request.full_url for request, _ in requests] == [
         "https://api.devin.ai/v1/sessions",
-        *["https://api.devin.ai/v1/sessions/devin_abc-123"] * 4,
+        *["https://api.devin.ai/v1/sessions/devin_abc-123"] * 5,
     ]
     assert all(timeout == 7 for _, timeout in requests)
     request = requests[0][0]
@@ -83,7 +84,16 @@ async def test_fixed_api_create_poll_result_and_terminate(monkeypatch):
     ],
 )
 async def test_provider_states_fail_closed(monkeypatch, provider, expected):
-    transport(monkeypatch, [{"session_id": "abc"}, {"status_enum": provider}, {}, {"status_enum": "stopped"}])
+    transport(
+        monkeypatch,
+        [
+            {"session_id": "abc"},
+            {"status_enum": provider},
+            {"status": "running", "status_enum": provider},
+            {},
+            {"status": "exit", "status_enum": "stopped"},
+        ],
+    )
     worker = DevinWorker(api_key="credential")
     handle = await worker.submit("task")
     assert (await worker.status(handle)).state is expected
@@ -137,8 +147,9 @@ async def test_failed_session_does_not_return_error_body(monkeypatch):
         [
             {"session_id": "abc"},
             {"status_enum": "error", "messages": ["private payload"], "structured_output": {"error": "secret"}},
+            {"status": "running", "status_enum": "error"},
             {},
-            {"status_enum": "stopped"},
+            {"status": "exit", "status_enum": "stopped"},
         ],
     )
     worker = DevinWorker(api_key="credential")
@@ -155,8 +166,9 @@ async def test_response_bounds_redaction_and_valid_structured_json(monkeypatch):
         [
             {"session_id": "abc"},
             {"status_enum": "finished", "messages": ["credential"], "structured_output": {"large": "x" * 70_000}},
+            {"status": "running", "status_enum": "finished"},
             {},
-            {"status_enum": "stopped"},
+            {"status": "exit", "status_enum": "stopped"},
         ],
     )
     worker = DevinWorker(api_key="credential")
@@ -169,13 +181,23 @@ async def test_response_bounds_redaction_and_valid_structured_json(monkeypatch):
 
 
 async def test_close_retries_remote_termination(monkeypatch):
-    requests, _ = transport(monkeypatch, [{"session_id": "abc"}, URLError("private"), {}, {"status_enum": "stopped"}])
+    requests, _ = transport(
+        monkeypatch,
+        [
+            {"session_id": "abc"},
+            {"status": "running"},
+            URLError("private"),
+            {"status": "running"},
+            {},
+            {"status": "exit", "status_enum": "stopped"},
+        ],
+    )
     worker = DevinWorker(api_key="credential")
     await worker.submit("task")
     with pytest.raises(WorkerError, match="retry aclose"):
         await worker.aclose()
     await worker.aclose()
-    assert [request.get_method() for request, _ in requests] == ["POST", "DELETE", "DELETE", "GET"]
+    assert [request.get_method() for request, _ in requests] == ["POST", "GET", "DELETE", "GET", "DELETE", "GET"]
     with pytest.raises(WorkerError, match="closed"):
         await worker.submit("another task")
 
@@ -192,7 +214,7 @@ async def test_cancelled_submission_terminates_created_session(monkeypatch):
             assert release.wait(3)
             return {"session_id": "abc"}
         if method == "GET":
-            return {"status_enum": "stopped"}
+            return {"status": "exit", "status_enum": "stopped"} if "DELETE" in methods else {"status": "running"}
         return {}
 
     worker = DevinWorker(api_key="credential")
@@ -203,7 +225,7 @@ async def test_cancelled_submission_terminates_created_session(monkeypatch):
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await submission
-    assert methods == ["POST", "DELETE", "GET"]
+    assert methods == ["POST", "GET", "DELETE", "GET"]
     await worker.aclose()
 
 
@@ -218,13 +240,16 @@ async def test_delete_acknowledgement_is_not_terminal_confirmation(monkeypatch):
         monkeypatch,
         [
             {"session_id": "abc"},
+            {"status": "running", "status_enum": "working"},
             {},
             {"status_enum": "unknown-new-state"},
             {"status_enum": "working"},
+            {"status": "running", "status_enum": "working"},
             {},
             {"status_enum": "blocked"},
+            {"status": "running", "status_enum": "working"},
             {},
-            {"status_enum": "stopped"},
+            {"status": "exit", "status_enum": "stopped"},
         ],
     )
     worker = DevinWorker(api_key="credential")
@@ -235,3 +260,48 @@ async def test_delete_acknowledgement_is_not_terminal_confirmation(monkeypatch):
         await worker.aclose()
     await worker.aclose()
     assert (await worker.status(handle)).state is WorkerState.CANCELLED
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        ("finished", WorkerState.COMPLETED),
+        ("error", WorkerState.FAILED),
+        ("stopped", WorkerState.CANCELLED),
+        ("unknown", WorkerState.RUNNING),
+    ],
+)
+@pytest.mark.parametrize("observe_first", [True, False])
+async def test_already_exited_sessions_never_receive_delete(monkeypatch, provider, expected, observe_first):
+    requests, _ = transport(
+        monkeypatch,
+        [
+            {"session_id": "abc"},
+            {"status": "exit", "status_enum": provider},
+        ],
+    )
+    worker = DevinWorker(api_key="credential")
+    handle = await worker.submit("task")
+    if observe_first:
+        assert (await worker.status(handle)).state is expected
+    await worker.cancel(handle)
+    await worker.aclose()
+    assert (await worker.status(handle)).state is expected
+    assert [request.get_method() for request, _ in requests] == ["POST", "GET"]
+
+
+async def test_finished_task_in_running_session_still_requires_delete(monkeypatch):
+    requests, _ = transport(
+        monkeypatch,
+        [
+            {"session_id": "abc"},
+            {"status": "running", "status_enum": "finished"},
+            {},
+            {"status": "exit", "status_enum": "stopped"},
+        ],
+    )
+    worker = DevinWorker(api_key="credential")
+    handle = await worker.submit("task")
+    await worker.cancel(handle)
+    await worker.aclose()
+    assert [request.get_method() for request, _ in requests] == ["POST", "GET", "DELETE", "GET"]

@@ -540,3 +540,34 @@ async def test_failed_submission_cleanup_remains_retryable(repository, monkeypat
     assert git(repository, "worktree", "list", "--porcelain").count("worktree ") == 2
     await coordinator.aclose()
     assert git(repository, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("configuration", ["diff.noprefix", "diff.mnemonicPrefix"])
+async def test_canonical_diff_paths_ignore_repository_prefix_configuration(repository, configuration):
+    git(repository, "config", configuration, "true")
+    git(repository, "config", "diff.relative", "true")
+    worker = FakeWorker()
+    async with WorkerCoordinator(repository, {"worker": worker}) as coordinator:
+        task_id = (await coordinator.submit_worker_task("worker", "change"))["task_id"]
+        tree = next(iter(worker.workspaces.values()))
+        assert tree is not None
+        (tree / "nested").mkdir()
+        (tree / "nested" / "artifact.py").write_text("approved nested content\n")
+        review = await coordinator.review_worker_changes(task_id)
+        assert "diff --git a/nested/artifact.py b/nested/artifact.py" in review["diff"]
+        assert (await approve_patch(coordinator, task_id))["result"]["state"] == "integrated"
+        assert (repository / "nested" / "artifact.py").read_text() == "approved nested content\n"
+        assert not (repository / "artifact.py").exists()
+
+
+async def test_approved_whitespace_is_not_rewritten_by_repository_configuration(repository):
+    git(repository, "config", "apply.whitespace", "fix")
+    worker = FakeWorker()
+    async with WorkerCoordinator(repository, {"worker": worker}) as coordinator:
+        task_id = (await coordinator.submit_worker_task("worker", "change"))["task_id"]
+        tree = next(iter(worker.workspaces.values()))
+        assert tree is not None
+        approved = b"literal trailing spaces  \n\t\n"
+        (tree / "hello.py").write_bytes(approved)
+        assert (await approve_patch(coordinator, task_id))["result"]["state"] == "integrated"
+        assert (repository / "hello.py").read_bytes() == approved

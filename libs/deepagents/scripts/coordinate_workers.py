@@ -107,7 +107,7 @@ async def _run(repository: Path, prompt: str) -> None:
         config: RunnableConfig = {"configurable": {"thread_id": uuid4().hex}}
         result = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config)
         while result.get("__interrupt__"):
-            approvals = {item.id: _approve(item.value) for item in result["__interrupt__"]}
+            approvals = {item.id: await asyncio.to_thread(_approve, item.value) for item in result["__interrupt__"]}
             result = await agent.ainvoke(Command(resume=approvals), config)
         print(result["messages"][-1].content)  # noqa: T201  # Display the coordinator's final answer.
 

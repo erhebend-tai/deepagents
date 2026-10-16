@@ -234,7 +234,23 @@ class WorkerCoordinator:
         with self._index(task.worktree, self._base) as index:
             _git(task.worktree, "add", "-A", "--", ".", index=index)
             patch = _git(
-                task.worktree, "diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", self._base, "--", index=index
+                task.worktree,
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "--no-relative",
+                "--no-renames",
+                "--no-color",
+                "--submodule=short",
+                "--ignore-submodules=none",
+                self._base,
+                "--",
+                index=index,
             )
         if len(patch) > _MAX_PATCH or re.search(rb"^(?:index .* |(?:new file|deleted file|old|new) mode )160000$", patch, re.MULTILINE):
             msg = "Worker patch is too large or contains unsupported submodule changes."
@@ -276,11 +292,11 @@ class WorkerCoordinator:
             raise WorkerError(msg)
         if snapshot.patch:
             with self._index(self._repository, self._expected_tree) as index:
-                _git(self._repository, "apply", "--cached", "--binary", patch=snapshot.patch, index=index)
+                _git(self._repository, "apply", "-p1", "--whitespace=nowarn", "--cached", "--binary", patch=snapshot.patch, index=index)
                 expected = _git(self._repository, "write-tree", index=index).decode("ascii").strip()
-            _git(self._repository, "apply", "--check", "--binary", patch=snapshot.patch)
+            _git(self._repository, "apply", "-p1", "--whitespace=nowarn", "--check", "--binary", patch=snapshot.patch)
             self._verify_main()
-            _git(self._repository, "apply", "--binary", patch=snapshot.patch)
+            _git(self._repository, "apply", "-p1", "--whitespace=nowarn", "--binary", patch=snapshot.patch)
             self._expected_tree = expected
             self._verify_main()
         task.integrated = True

@@ -25,6 +25,7 @@ async def test_argument_vector_environment_and_bounded_output(monkeypatch, works
     monkeypatch.setenv("DEVIN_API_KEY", "devin-secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
     monkeypatch.setenv("COPILOT_GITHUB_TOKEN", credential)
+    monkeypatch.setenv("COPILOT_ALLOW_ALL", "true")
     monkeypatch.setenv("GIT_CONFIG_COUNT", "12")
     stream = asyncio.StreamReader()
     stream.feed_data(b"x" * 100_000 + credential.encode())
@@ -40,12 +41,13 @@ async def test_argument_vector_environment_and_bounded_output(monkeypatch, works
     handle = await worker.submit(prompt, cwd=workspace)
     assert await completed(worker, handle) is WorkerState.COMPLETED
     arguments = launch.call_args.args
-    assert arguments == ("/usr/bin/copilot", "-p", prompt, "--allow-tool", "read", "--allow-tool", "write")
+    assert arguments == ("/usr/bin/copilot", "-p", prompt, "--deny-tool", "shell", "--allow-tool", "read", "--allow-tool", "write")
     environment = launch.call_args.kwargs["env"]
     assert environment["COPILOT_GITHUB_TOKEN"] == credential
     assert "DEVIN_API_KEY" not in environment
     assert "AWS_SECRET_ACCESS_KEY" not in environment
     assert "GIT_CONFIG_COUNT" not in environment
+    assert "COPILOT_ALLOW_ALL" not in environment
     assert launch.call_args.kwargs["cwd"] == workspace
     assert launch.call_args.kwargs["start_new_session"] is (os.name == "posix")
     result = await worker.result(handle)
@@ -149,3 +151,31 @@ def test_no_broad_tool_permissions(permissions):
 def test_invalid_deadline(timeout):
     with pytest.raises(ValueError, match="timeout"):
         CopilotWorker(timeout=timeout)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group ID reuse")
+@pytest.mark.parametrize("outcome", ["completed", "timeout"])
+async def test_terminal_cleanup_never_signals_historic_process_group_again(monkeypatch, workspace, outcome):
+    stream = asyncio.StreamReader()
+    stream.feed_eof()
+    kill = Mock()
+
+    async def wait():
+        if outcome == "timeout" and not kill.called:
+            await asyncio.Event().wait()
+        return 0 if outcome == "completed" else -9
+
+    process = Mock(stdout=stream, pid=43210, returncode=None, wait=AsyncMock(side_effect=wait))
+    monkeypatch.setattr("deepagents.workers.copilot.shutil.which", lambda _executable: "/usr/bin/copilot")
+    monkeypatch.setattr("deepagents.workers.copilot.asyncio.create_subprocess_exec", AsyncMock(return_value=process))
+    monkeypatch.setattr("deepagents.workers.copilot.os.killpg", kill)
+    worker = CopilotWorker(timeout=0.01 if outcome == "timeout" else 1)
+    handle = await worker.submit("task", cwd=workspace)
+    expected = WorkerState.COMPLETED if outcome == "completed" else WorkerState.TIMED_OUT
+    assert await completed(worker, handle) is expected
+    assert kill.call_count == 1
+    await worker.cancel(handle)
+    await worker.cancel(handle)
+    await worker.aclose()
+    await worker.aclose()
+    assert kill.call_count == 1

@@ -129,6 +129,10 @@ class DevinWorker:
             "error": WorkerState.FAILED,
             "blocked": WorkerState.BLOCKED,
         }.get(str(payload.get("status_enum")), WorkerState.RUNNING)
+        # Task completion does not imply the billable session has exited.
+        if payload.get("status") == "exit":
+            self._sessions.discard(handle)
+            self._terminated[handle] = state, payload
         return state, payload
 
     async def status(self, handle: str) -> WorkerStatus:
@@ -156,19 +160,19 @@ class DevinWorker:
         return WorkerResult(state, output, structured)
 
     async def cancel(self, handle: str) -> None:
-        """Request cancellation and confirm terminal state before retiring it.
+        """Skip exited sessions; retire resources only on explicit `status=exit`.
+
+        `status_enum=finished` describes the task, not the session's lifecycle.
+        A still-running session must receive DELETE and a confirming observation.
 
         Args:
             handle: Private session handle returned by `submit`.
         """
-        self._known(handle)
-        if handle in self._terminated:
+        _, payload = await self._observe(handle)
+        if payload.get("status") == "exit":
             return
         await asyncio.to_thread(self._request, "DELETE", handle)
-        state, payload = await self._observe(handle)
-        if state.terminal:
-            self._sessions.discard(handle)
-            self._terminated[handle] = state, payload
+        await self._observe(handle)
 
     async def aclose(self) -> None:
         """Terminate all owned sessions; failed termination remains retryable."""
